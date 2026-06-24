@@ -1,0 +1,1145 @@
+---
+title: "RNAseq025-ZymoSeq"
+author: "Victor Toledo"
+date: "2025-01-07"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Differential expression of RNA-seq data from DMD with TEA and without TEA (Débora project), mapped with STAR and quantified with RSEM
+
+NSCs and neurons differentiated from iPSCs of patients with DMD/DMB + TEA have differentially expressed genes compared with control patients (DMD/DMB without TEA)
+
+code by Victor Toledo (victor.toledo.btos@gmail.com) 
+
+
+```{r  message = FALSE, warning = FALSE}
+options(stringsAsFactors = FALSE)
+
+setwd("/PROJECT_DIR")
+
+library(DESeq2)
+#library(hrbrthemes)
+library(tximport)
+library(tidyverse)
+library(pheatmap)
+library(viridis)
+library(rmarkdown)
+library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+library(biomaRt)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(ReactomePA)
+library(ggplot2)
+library(reshape2)
+library(edgeR)
+library(SummarizedExperiment)
+library(WGCNA)
+library(variancePartition)
+#library(RUVSeq)
+library(RColorBrewer)
+library(EDASeq)
+library(tibble)
+library(dplyr)
+library(tidyr)
+library(fgsea)
+#library(ComplexHeatmap)
+library(circlize)
+library(data.table)
+library(ggrepel)
+```
+
+### Importing all samples to understand the expression profile
+Controls: F07007, F014932, F012262-4  
+DMD patients without TEA: C023903, C026484, F012161-1  
+DMD patients with TEA: C026023, F012161-4, C026786
+
+Related individuals: F012161-1 and F012161-4 are monozygotic twins
+
+Samples MRP1 to 9 are NSCs, while MRP10 to 18 are neurons
+
+- In this step, all samples will be analyzed separately to identify possible outliers and low-quality samples.
+
+#### Pre-processing
+
+```{r warning = TRUE}
+# build the samples manually to change everything easily
+setwd("/PROJECT_DIR/RSEM_quant/")
+samples <- data.frame(sample = as.factor(gsub("(.+?)(\\_.*)", "\\1", list.files(pattern = ".genes.results"))),
+                      condition=c("control","control","control","control",rep("patient",6),rep("control",2),rep("patient",6)),
+                      mut_type=c(rep("none",4),"duplication","deletion","deletion","indel","deletion","snv",
+                                 "none","none","duplication","deletion","deletion","indel","deletion","snv"),
+                      TEA=c(rep("no",7),rep("yes",3),rep("no",5),rep("yes",3)),
+                      individual=c("F07007","F07007","F014932","F012262-4","C023903","C026484","F012161-1","C026023","F012161-4",
+                                   "C026786","F014932","F012262-4","C023903","C026484","F012161-1","C026023","F012161-4","C026786"),
+                      new_name=c("C1","C1","C2","C3","P1","P2","P3","P4","P5","P6","C2","C3","P1","P2","P3","P4","P5","P6"),
+                      age=c(27,27,25,9,16,20,20,15,20,14,25,9,16,20,20,15,20,14),
+                      cell_type=c("NSC",rep("neuron",9),rep("NSC",8)))
+samples$data <- paste(samples$new_name,samples$cell_type,sep="_")
+#samples$group <- paste(samples$DMD_condition,samples$TEA,sep="")
+
+write.table(samples, file = "/PROJECT_DIR/metadata.txt", sep = "\t", quote = FALSE)
+
+files <- list.files(pattern = ".genes.results")
+names(files) <- samples$sample
+all(file.exists(files))
+
+# import quantified reads (counts)
+txi = tximport(files, type = "rsem", txIn = FALSE, txOut = FALSE)
+txi$length[txi$length == 0] = 0.01
+
+# create deseq2 object with the information about the samples
+dds <- DESeqDataSetFromTximport(txi, colData = samples, design = ~condition)
+
+#check if samples have been correctly assigned to metadata
+pt <- as.data.frame(dds@colData)
+paged_table(pt)
+
+# In some experiments, it may not be appropriate to assume that a minority of features (genes) are affected greatly by the condition, such that the standard median-ratio method for estimating the size factors will not provide correct inference (the log fold changes for features that were truly un-changing will not centered on zero)
+#you can provide control genes that you don't expect to change expression in order to better estimate 
+#dds <- estimateSizeFactors(dds, controlGenes=ctrlGenes)
+#dds <- DESeq(dds)
+
+# While it is not necessary to pre-filter low count genes before running the DESeq2 functions, there are two reasons which make pre-filtering useful: by removing rows in which there are very few reads, we reduce the memory size of the dds data object, and we increase the speed of count modeling within DESeq2. It can also improve visualizations, as features with no information for differential expression are not plotted in dispersion plots or MA-plots.
+smallestGroupSize <- 3
+keep <- rowSums(counts(dds) >= 20) >= smallestGroupSize
+dds <- dds[keep,]
+dds <- DESeq(dds)
+
+counts_table <- counts(dds, normalized = TRUE) ### this is the correct normalization to use if testing for differential expression using limma, it divides counts by the sizeFactor which relates to the library depth
+write.table(counts_table, file = "/PROJECT_DIR/RSEM_quant/counts_table.txt", sep = "\t", quote = FALSE)
+```
+
+
+```{r warning = TRUE}
+exp_file_raw <- counts(dds,normalized = FALSE)
+dup_genes <- gsub(".*_","",rownames(exp_file_raw))
+exp_file_raw <- exp_file_raw[!duplicated(dup_genes),]
+exp_file_raw <- as.data.frame(exp_file_raw)
+exp_file_raw$SYMBOL <- gsub(".*_","",rownames(exp_file_raw))
+exp_file_raw <- exp_file_raw[,c(19,1:18)]
+write.table(exp_file_raw, file = "/PROJECT_DIR/raw_expression_file.txt", quote = FALSE, row.names = F, sep = "\t")
+
+exp_file <- counts(dds,normalized = TRUE)
+dup_genes <- gsub(".*_","",rownames(exp_file))
+exp_file <- exp_file[!duplicated(dup_genes),]
+exp_file <- as.data.frame(exp_file)
+exp_file$SYMBOL <- gsub(".*_","",rownames(exp_file))
+exp_file <- exp_file[,c(19,1:18)]
+write.table(exp_file, file = "/PROJECT_DIR/expression_file.txt", quote = FALSE, row.names = F, sep = "\t")
+
+tpm_values <- as.data.frame(txi$abundance)
+keep2 <- rowSums(tpm_values) >= 10
+tpm_values <- tpm_values[keep2,]
+tpm_values$gene_symbol <-gsub("^.*?_", "", rownames(tpm_values))
+
+dup_genes1 <- gsub("^.*?_","",rownames(tpm_values))
+tpm_values <- tpm_values[!duplicated(dup_genes1),]
+tpm_values <- as.data.frame(tpm_values)
+rownames(tpm_values) <- tpm_values$gene_symbol
+tpm_values <- tpm_values[,-19]
+write.table(tpm_values, file = "/PROJECT_DIR/mixture_RNASeq025_CIBERSORT.txt", quote = FALSE, row.names = T, sep = "\t")
+```
+
+#### Distribution of quantification values
+
+```{r  warning = TRUE}
+log_counts_table <- log(counts_table)
+M <- mean(colSums(counts_table)) * 1e-6
+L <- median(colSums(counts_table)) * 1e-6
+
+lcpm.cutoff <- log2(10/M + 2/L)
+
+nsamples <- ncol(log_counts_table)
+mlc <- melt(log_counts_table)
+
+p <- ggplot(aes(x=value, colour=Var2), data=mlc)
+p + geom_density()
+```
+
+Before mean normalization
+
+```{r  warning = TRUE}
+#set <- newSeqExpressionSet(as.matrix(exp_file_ruvseq),phenoData = data.frame(samples, row.names=colnames(exp_file_ruvseq)))
+set1 <- newSeqExpressionSet(as.matrix(exp_file_raw),phenoData = data.frame(samples, row.names=colnames(exp_file_raw)))
+set1
+colors <- brewer.pal(9, "Set1")
+plotRLE(set1, outline=FALSE,ylim=c(-4, 4), col=colors[as.numeric(factor(samples$individual))])
+```
+
+
+Showing that the distribution of values normalized by varianceStabilizingTransformation is appropriate
+
+```{r  warning = TRUE}
+set <- newSeqExpressionSet(as.matrix(exp_file),phenoData = data.frame(samples, row.names=colnames(exp_file)))
+set
+colors <- brewer.pal(8, "Set1")
+plotRLE(set, outline=FALSE,ylim=c(-4, 4), col=colors[as.numeric(factor(samples$individual))])
+```
+
+##### Generating PCA plots (group)
+
+```{r  warning = TRUE}
+library(ggrepel)
+set.seed(20)
+
+png(
+  "/PROJECT_DIR/RSEM_quant/PCA_grupo.png",
+  width     = 10,
+  height    = 4,
+  units     = "in",
+  res       = 1200
+)
+par(
+  mar = c(2,5,2,5),
+  cex = 1
+)
+vsd <- vst(dds, blind = TRUE)
+pca <- plotPCA(vsd, intgroup = "condition",ntop = 1000) #use only the top 1000 genes by variability
+#nudge <- position_nudge(y = 3)
+pca + geom_text_repel(size = 2,aes(label = rownames(dds@colData)), max.overlaps = Inf)
+dev.off()
+
+pca + geom_text_repel(size = 2,aes(label = rownames(dds@colData)), max.overlaps = Inf)
+```
+
+##### Generating PCA plots (TEA)
+
+```{r  warning = TRUE}
+library(ggrepel)
+set.seed(20)
+
+png(
+  "/PROJECT_DIR/RSEM_quant/PCA_DMD.png",
+  width     = 10,
+  height    = 4,
+  units     = "in",
+  res       = 1200
+)
+par(
+  mar = c(2,5,2,5),
+  cex = 1
+)
+vsd <- vst(dds, blind = TRUE)
+pca <- plotPCA(vsd, intgroup = "TEA",ntop = 1000) #use only the top 1000 genes by variability
+#nudge <- position_nudge(y = 3)
+pca + geom_text_repel(size = 2,aes(label = rownames(dds@colData)), max.overlaps = Inf)
+dev.off()
+
+pca + geom_text_repel(size = 2,aes(label = rownames(dds@colData)), max.overlaps = Inf)
+```
+
+
+##### Generating PCA plots (mutational type)
+
+```{r  warning = TRUE}
+png(
+  "/PROJECT_DIR/RSEM_quant/PCA_mut_type.png",
+  width     = 10,
+  height    = 4,
+  units     = "in",
+  res       = 1200
+)
+par(
+  mar = c(2,5,2,5),
+  cex = 1
+)
+pca <- plotPCA(vsd, intgroup = "mut_type",ntop = 1000)
+#nudge <- position_nudge(y = 3)
+pca + geom_text_repel(size = 2,aes(label = rownames(dds@colData)), max.overlaps = Inf)
+dev.off()
+
+pca + geom_text_repel(size = 2,aes(label = rownames(dds@colData)), max.overlaps = Inf)
+```
+
+-Generating PCA plots (individual)
+
+```{r  warning = TRUE}
+png(
+  "/PROJECT_DIR/RSEM_quant/PCA_sample.png",
+  width     = 10,
+  height    = 4,
+  units     = "in",
+  res       = 1200
+)
+par(
+  mar = c(2,5,2,5),
+  cex = 1
+)
+
+pca <- plotPCA(vsd, intgroup = "individual",ntop = 1000)
+#nudge <- position_nudge(y = 3)
+pca + geom_text_repel(size = 2,aes(label = rownames(dds@colData)), max.overlaps = Inf)
+dev.off()
+
+pca + geom_text_repel(size = 2,aes(label = rownames(dds@colData)), max.overlaps = Inf)
+```
+
+
+##### Generating PCA plots (cell type)
+
+```{r  warning = TRUE}
+png(
+  "/PROJECT_DIR/RSEM_quant/PCA_celltype.png",
+  width     = 10,
+  height    = 4,
+  units     = "in",
+  res       = 1200
+)
+par(
+  mar = c(2,5,2,5),
+  cex = 1
+)
+
+pca <- plotPCA(vsd, intgroup = "cell_type",ntop = 1000)
+#nudge <- position_nudge(y = 3)
+pca + geom_text_repel(size = 2,aes(label = rownames(dds@colData)), max.overlaps = Inf)
+dev.off()
+
+pca + geom_text_repel(size = 2,aes(label = rownames(dds@colData)), max.overlaps = Inf)
+```
+
+
+
+<!-- -Normalization for sequencing depth -->
+<!-- ```{r  warning = TRUE} -->
+<!-- set <- betweenLaneNormalization(set, which="upper") -->
+<!-- plotRLE(set, outline=FALSE, ylim=c(-4, 4), col=colors[as.numeric(factor(samples$individual))]) -->
+<!-- ``` -->
+<!-- -PCA with normalized data -->
+<!-- ```{r  warning = TRUE} -->
+<!-- plotPCA(set, col=colors[as.numeric(factor(samples$individual))], cex=1.2) -->
+<!-- ``` -->
+
+
+Not done because the gene symbol was already present: ###### Creating files to annotate the transcripts with gene symbols
+```{r  warning = TRUE}
+#anot <- fread(file = "/PATH/TO/ANNOTATION.gtf")
+#anot <- data.frame(anot$V9)
+#anot2 <- data.frame(do.call('rbind', strsplit(as.character(anot$anot.V9),';',fixed=TRUE)))
+#anot2 <- anot2[grep("gene_type",anot2$X2),]
+#
+#anot_table = data.frame(ensembl_gene_id = sub('[^\\"]+\\"([^\\"]+).*', '\\1', anot2$X1),
+#                        gene_name = sub('[^\\"]+\\"([^\\"]+).*', '\\1', anot2$X3))
+
+#rm(anot, anot2)
+exp_file_normalized <- as.data.frame(set@assayData$counts)
+```
+
+
+#### How is the expression of housekeeping genes and markers in these samples? First for NSC
+- General housekeeping genes:
+https://doi.org/10.1016/j.tig.2014.02.001: "C1orf43", "CHMP2A", "EMC7", "GPI", "PSMB2", "PSMB4", "RAB7A", "REEP5", "SNRPD3", "VCP", "VPS29"
+- NSC marker genes:
+"SOX2","PAX6","NES","PROM1","BMI1","EZH2","NEUROG2","ASCL1","TBR1","SLC1A3","MKI67" (chatGPT)
+- Neuron marker genes:
+"BTBD11","DISP2","GALNTL6","SERTM1","SYT13","VSTM2A","ZMAT4" (https://www.nature.com/articles/s41598-018-27293-5/tables/2)
+
+
+```{r  warning = TRUE}
+housekeeping_genes <- c("C1orf43", "CHMP2A", "EMC7", "GPI", "PSMB2", "PSMB4", "RAB7A", "REEP5", "SNRPD3", "VCP", "VPS29","SOX2","PAX6","NES","PROM1","BMI1","EZH2","NEUROG2","ASCL1","TBR1","SLC1A3","MKI67","BTBD11","DISP2","GALNTL6","SERTM1","SYT13","VSTM2A","ZMAT4")
+
+sub(".*_","",rownames(exp_file_normalized)) -> exp_file_normalized$gene_symbol
+
+dup_genes <- gsub(".*_","",rownames(exp_file_normalized))
+exp_file_normalized <- exp_file_normalized[!duplicated(dup_genes),]
+exp_file_normalized <- as.data.frame(exp_file_normalized)
+
+rownames(exp_file_normalized) <- exp_file_normalized$gene_symbol
+exp_file_normalized <- exp_file_normalized[,-19]
+write.table(exp_file_normalized, file = "/PROJECT_DIR/RSEM_quant/exp_file_symbol.tsv", row.names = FALSE, sep = "\t", quote = FALSE)
+
+hg_exp <- exp_file_normalized[rownames(exp_file_normalized) %in% housekeeping_genes,]
+hg_exp <- hg_exp[,colnames(hg_exp) %in% samples$sample[samples$cell_type == "NSC"]]
+hg_exp$genes <- rownames(hg_exp)
+hg_melt1 <- melt(hg_exp, id.vars= "genes")
+hg_melt1$value <- as.numeric(hg_melt1$value)
+hg_melt1$value[hg_melt1$value < 1] <- 1
+hg_melt1$genes <- factor(hg_melt1$genes, levels = c("C1orf43", "CHMP2A", "EMC7", "GPI", "PSMB2", "PSMB4", "RAB7A", "REEP5", "SNRPD3", "VCP", "VPS29","SOX2","PAX6","NES","PROM1","BMI1","EZH2","NEUROG2","ASCL1","TBR1","SLC1A3","MKI67","BTBD11","DISP2","GALNTL6","SERTM1","SYT13","VSTM2A","ZMAT4"))
+
+png(
+  "/PROJECT_DIR/RSEM_quant/NSC_housekeeping_genes.png",
+  width     = 18,
+  height    = 8,
+  units     = "in",
+  res       = 1200
+)
+par(
+  mar = c(2,5,2,5),
+  cex = 1
+)             
+hg_melt1%>%
+  ggplot(aes(x=genes, y=log2(value), group=variable, color=variable)) +
+    geom_line() + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+dev.off()
+
+hg_melt1%>%
+  ggplot(aes(x=genes, y=log2(value), group=variable, color=variable)) +
+    geom_line() + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+```
+
+##### How is the expression of housekeeping genes and markers in the neuron samples
+
+```{r  warning = TRUE}
+hg_exp <- exp_file_normalized[rownames(exp_file_normalized) %in% housekeeping_genes,]
+hg_exp <- hg_exp[,colnames(hg_exp) %in% samples$sample[samples$cell_type == "neuron"]]
+hg_exp$genes <- rownames(hg_exp)
+hg_melt2 <- melt(hg_exp, id.vars= "genes")
+hg_melt2$value <- as.numeric(hg_melt2$value)
+hg_melt2$value[hg_melt2$value < 1] <- 1
+hg_melt2$genes <- factor(hg_melt2$genes, levels = c("C1orf43", "CHMP2A", "EMC7", "GPI", "PSMB2", "PSMB4", "RAB7A", "REEP5", "SNRPD3", "VCP", "VPS29","SOX2","PAX6","NES","PROM1","BMI1","EZH2","NEUROG2","ASCL1","TBR1","SLC1A3","MKI67","BTBD11","DISP2","GALNTL6","SERTM1","SYT13","VSTM2A","ZMAT4"))
+
+png(
+  "/PROJECT_DIR/RSEM_quant/neuron_housekeeping_genes.png",
+  width     = 18,
+  height    = 8,
+  units     = "in",
+  res       = 1200
+)
+par(
+  mar = c(2,5,2,5),
+  cex = 1
+)             
+hg_melt2%>%
+  ggplot(aes(x=genes, y=log2(value), group=variable, color=variable)) +
+    geom_line() + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+dev.off()
+
+hg_melt2%>%
+  ggplot(aes(x=genes, y=log2(value), group=variable, color=variable)) +
+    geom_line() + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+```
+
+#### Plotting expression of important lineage genes
+I used log2 of the quantification values because some lowly expressed genes make the other values too small in comparison.
+
+#### Plotting expression of important neuronal lineage genes in neurons
+
+```{r  warning = TRUE}
+library(hrbrthemes)
+neuron_list <- read.table("/PROJECT_DIR/neuron_markers.txt")[,1]
+nsc_counts <- subset(exp_file_normalized, rownames(exp_file_normalized) %in% neuron_list)
+#nsc_counts <- nsc_counts[,colnames(nsc_counts) %in% samples$sample[samples$cell_type == "neuron"]]
+rownames(nsc_counts) -> nsc_counts$gene_name
+melted_nsc_counts <- melt(nsc_counts)
+melted_nsc_counts$value[melted_nsc_counts$value <= 1] <- 1
+
+melted_nsc_counts$variable <- factor(melted_nsc_counts$variable, levels = c("MRP-1-RNASeq025-ZymoSeq","MRP-2-RNASeq025-ZymoSeq","MRP-3-RNASeq025-ZymoSeq","MRP-4-RNASeq025-ZymoSeq","MRP-5-RNASeq025-ZymoSeq","MRP-6-RNASeq025-ZymoSeq",
+  "MRP-7-RNASeq025-ZymoSeq","MRP-8-RNASeq025-ZymoSeq","MRP-9-RNASeq025-ZymoSeq","MRP-10-RNASeq025-ZymoSeq","MRP-11-RNASeq025-ZymoSeq","MRP-12-RNASeq025-ZymoSeq",
+  "MRP-13-RNASeq025-ZymoSeq","MRP-14-RNASeq025-ZymoSeq","MRP-15-RNASeq025-ZymoSeq","MRP-16-RNASeq025-ZymoSeq","MRP-17-RNASeq025-ZymoSeq","MRP-18-RNASeq025-ZymoSeq"))
+
+png(
+  "/PROJECT_DIR/RSEM_quant/neuron_neural_lineage_genes.png",
+  width     = 18,
+  height    = 8,
+  units     = "in",
+  res       = 1200
+)
+par(
+  mar = c(2,5,2,5),
+  cex = 1
+)  
+ ggplot(melted_nsc_counts, aes(gene_name, variable, fill= log2(value))) +
+   geom_tile() +  scale_fill_viridis(discrete=FALSE) +
+   theme_ipsum() + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+ 
+ dev.off()
+ 
+ ggplot(melted_nsc_counts, aes(gene_name, variable, fill= log2(value))) +
+   geom_tile() +  scale_fill_viridis(discrete=FALSE) +
+   theme_ipsum() + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+```
+
+#### variancePartition
+Estimate how much each covariate explains the variability in expression values
+
+```{r  warning = TRUE}
+# Run the variancePartition analysis on the counts table to account for contributions of each covariate to data variability:
+
+  # First file must be the counts: genes in rows and samples in columns
+  # Second must be the metadata: all covariates for each sample
+  # Third must be the formula
+
+covariates = samples
+form = ~ age + (1|individual) + (1|cell_type) # + (1|RIN) 
+
+exp_varpart <- counts(set)
+varPart <- fitExtractVarPartModel(exp_varpart, form, covariates)
+vp <- sortCols(varPart)
+plotPercentBars(vp[1:10,])
+png("/PROJECT_DIR/RSEM_quant/allsamples_variancePartition_total.png", units="in", width=8, height=4, res=800)
+plotVarPart(vp)
+dev.off()
+plotVarPart(vp)
+```
+
+- Hierarchical clustering of expression values
+
+```{r  warning = TRUE}
+exp <- counts(dds, normalized=TRUE)
+
+sampleTree = hclust(dist(t(exp)), method = "average")
+par(mar = c(0, 0, 0, 0))
+
+traitData <- samples
+traitData$condition <- recode(traitData$condition, "control" = 0, "patient" = 1)
+traitColors = traitData$condition
+traitColors[traitColors == 0] <- "#fbaca7"
+traitColors[traitColors == 1] <- "#52d8da"
+
+png(
+  "/PROJECT_DIR/RSEM_quant/hclust_expression_data.png",
+  width     = 18,
+  height    = 8,
+  units     = "in",
+  res       = 1200
+)
+par(
+  mar = c(2,5,2,5),
+  cex = 1
+)  
+p <- plotDendroAndColors(sampleTree, traitColors,
+                    groupLabels = names(traitData$Sex),
+                    main = "Sample dendrogram (colors represent condition)")
+p
+dev.off()
+p
+```
+
+- A heatmap of this distance matrix gives us an overview of similarities and dissimilarities between samples. We have to provide a hierarchical clustering hc to the heatmap function based on the sample distances, or else the heatmap function would calculate a clustering based on the distances between the rows/columns of the distance matrix.
+
+```{r  warning = TRUE}
+sampleDists <- dist(t(assay(vsd)))
+
+library("RColorBrewer")
+sampleDistMatrix <- as.matrix(sampleDists)
+rownames(sampleDistMatrix) <- paste(vsd$condition, vsd$sample, vsd$cell_type, vsd$treatment, sep="-")
+colnames(sampleDistMatrix) <- NULL
+colors <- colorRampPalette( rev(brewer.pal(9, "Blues")) )(255)
+
+png(
+  "/PROJECT_DIR/RSEM_quant/distance_matrix_heatmap.png",
+  width     = 18,
+  height    = 8,
+  units     = "in",
+  res       = 1200
+)
+par(
+  mar = c(2,5,2,5),
+  cex = 1
+)  
+pheatmap(sampleDistMatrix,
+         clustering_distance_rows=sampleDists,
+         clustering_distance_cols=sampleDists,
+         col=colors)
+dev.off()
+
+pheatmap(sampleDistMatrix,
+         clustering_distance_rows=sampleDists,
+         clustering_distance_cols=sampleDists,
+         col=colors)
+```
+
+- Looking at the top 20 most expressed genes:
+
+```{r  warning = TRUE}
+ntd <- normTransform(dds)
+select <- order(rowMeans(counts(dds,normalized=TRUE)),
+                decreasing=TRUE)[1:20]
+df <- as.data.frame(colData(dds)[,c("condition","cell_type")])
+
+png(
+  "/PROJECT_DIR/RSEM_quant/top20_heatmap.png",
+  width     = 18,
+  height    = 8,
+  units     = "in",
+  res       = 1200
+)
+par(
+  mar = c(2,5,2,5),
+  cex = 1
+)  
+pheatmap(assay(ntd)[select,], cluster_rows=FALSE, show_rownames=T,
+         cluster_cols=FALSE, annotation_col=df)
+dev.off()
+
+pheatmap(assay(ntd)[select,], cluster_rows=FALSE, show_rownames=T,
+         cluster_cols=FALSE, annotation_col=df)
+```---
+title: "RNAseq025-ZymoSeq"
+author: "Victor Toledo"
+date: "2025-01-07"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Differential expression of RNA-seq data from DMD with TEA and without TEA (Débora project), mapped with STAR and quantified with RSEM
+
+NSCs and neurons differentiated from iPSCs of patients with DMD/DMB + TEA have differentially expressed genes compared with control patients (DMD/DMB without TEA)
+
+code by Victor Toledo (victor.toledo.btos@gmail.com) 
+
+
+```{r  message = FALSE, warning = FALSE}
+options(stringsAsFactors = FALSE)
+
+setwd("/PROJECT_DIR")
+
+library(DESeq2)
+#library(hrbrthemes)
+library(tximport)
+library(tidyverse)
+library(pheatmap)
+library(viridis)
+library(rmarkdown)
+library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+library(biomaRt)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(ReactomePA)
+library(ggplot2)
+library(reshape2)
+library(edgeR)
+library(SummarizedExperiment)
+library(WGCNA)
+library(variancePartition)
+#library(RUVSeq)
+library(RColorBrewer)
+library(EDASeq)
+library(tibble)
+library(dplyr)
+library(tidyr)
+library(fgsea)
+#library(ComplexHeatmap)
+library(circlize)
+library(data.table)
+library(ggrepel)
+```
+
+### Importing all samples to understand the expression profile
+Controls: F07007, F014932, F012262-4  
+DMD patients without TEA: C023903, C026484, F012161-1  
+DMD patients with TEA: C026023, F012161-4, C026786
+
+Related individuals: F012161-1 and F012161-4 are monozygotic twins
+
+Samples MRP1 to 9 are NSCs, while MRP10 to 18 are neurons
+
+- In this step, all samples will be analyzed separately to identify possible outliers and low-quality samples.
+
+#### Pre-processing
+
+```{r warning = TRUE}
+# build the samples manually to change everything easily
+setwd("/PROJECT_DIR/RSEM_quant/")
+samples <- data.frame(sample = as.factor(gsub("(.+?)(\\_.*)", "\\1", list.files(pattern = ".genes.results"))),
+                      condition=c("control","control","control","control",rep("patient",6),rep("control",2),rep("patient",6)),
+                      mut_type=c(rep("none",4),"duplication","deletion","deletion","indel","deletion","snv",
+                                 "none","none","duplication","deletion","deletion","indel","deletion","snv"),
+                      TEA=c(rep("no",7),rep("yes",3),rep("no",5),rep("yes",3)),
+                      individual=c("F07007","F07007","F014932","F012262-4","C023903","C026484","F012161-1","C026023","F012161-4",
+                                   "C026786","F014932","F012262-4","C023903","C026484","F012161-1","C026023","F012161-4","C026786"),
+                      new_name=c("C1","C1","C2","C3","P1","P2","P3","P4","P5","P6","C2","C3","P1","P2","P3","P4","P5","P6"),
+                      age=c(27,27,25,9,16,20,20,15,20,14,25,9,16,20,20,15,20,14),
+                      cell_type=c("NSC",rep("neuron",9),rep("NSC",8)))
+samples$data <- paste(samples$new_name,samples$cell_type,sep="_")
+#samples$group <- paste(samples$DMD_condition,samples$TEA,sep="")
+
+write.table(samples, file = "/PROJECT_DIR/metadata.txt", sep = "\t", quote = FALSE)
+
+files <- list.files(pattern = ".genes.results")
+names(files) <- samples$sample
+all(file.exists(files))
+
+# import quantified reads (counts)
+txi = tximport(files, type = "rsem", txIn = FALSE, txOut = FALSE)
+txi$length[txi$length == 0] = 0.01
+
+# create deseq2 object with the information about the samples
+dds <- DESeqDataSetFromTximport(txi, colData = samples, design = ~condition)
+
+#check if samples have been correctly assigned to metadata
+pt <- as.data.frame(dds@colData)
+paged_table(pt)
+
+# In some experiments, it may not be appropriate to assume that a minority of features (genes) are affected greatly by the condition, such that the standard median-ratio method for estimating the size factors will not provide correct inference (the log fold changes for features that were truly un-changing will not centered on zero)
+#you can provide control genes that you don't expect to change expression in order to better estimate 
+#dds <- estimateSizeFactors(dds, controlGenes=ctrlGenes)
+#dds <- DESeq(dds)
+
+# While it is not necessary to pre-filter low count genes before running the DESeq2 functions, there are two reasons which make pre-filtering useful: by removing rows in which there are very few reads, we reduce the memory size of the dds data object, and we increase the speed of count modeling within DESeq2. It can also improve visualizations, as features with no information for differential expression are not plotted in dispersion plots or MA-plots.
+smallestGroupSize <- 3
+keep <- rowSums(counts(dds) >= 20) >= smallestGroupSize
+dds <- dds[keep,]
+dds <- DESeq(dds)
+
+counts_table <- counts(dds, normalized = TRUE) ### this is the correct normalization to use if testing for differential expression using limma, it divides counts by the sizeFactor which relates to the library depth
+write.table(counts_table, file = "/PROJECT_DIR/RSEM_quant/counts_table.txt", sep = "\t", quote = FALSE)
+```
+
+
+```{r warning = TRUE}
+exp_file_raw <- counts(dds,normalized = FALSE)
+dup_genes <- gsub(".*_","",rownames(exp_file_raw))
+exp_file_raw <- exp_file_raw[!duplicated(dup_genes),]
+exp_file_raw <- as.data.frame(exp_file_raw)
+exp_file_raw$SYMBOL <- gsub(".*_","",rownames(exp_file_raw))
+exp_file_raw <- exp_file_raw[,c(19,1:18)]
+write.table(exp_file_raw, file = "/PROJECT_DIR/raw_expression_file.txt", quote = FALSE, row.names = F, sep = "\t")
+
+exp_file <- counts(dds,normalized = TRUE)
+dup_genes <- gsub(".*_","",rownames(exp_file))
+exp_file <- exp_file[!duplicated(dup_genes),]
+exp_file <- as.data.frame(exp_file)
+exp_file$SYMBOL <- gsub(".*_","",rownames(exp_file))
+exp_file <- exp_file[,c(19,1:18)]
+write.table(exp_file, file = "/PROJECT_DIR/expression_file.txt", quote = FALSE, row.names = F, sep = "\t")
+
+tpm_values <- as.data.frame(txi$abundance)
+keep2 <- rowSums(tpm_values) >= 10
+tpm_values <- tpm_values[keep2,]
+tpm_values$gene_symbol <-gsub("^.*?_", "", rownames(tpm_values))
+
+dup_genes1 <- gsub("^.*?_","",rownames(tpm_values))
+tpm_values <- tpm_values[!duplicated(dup_genes1),]
+tpm_values <- as.data.frame(tpm_values)
+rownames(tpm_values) <- tpm_values$gene_symbol
+tpm_values <- tpm_values[,-19]
+write.table(tpm_values, file = "/PROJECT_DIR/mixture_RNASeq025_CIBERSORT.txt", quote = FALSE, row.names = T, sep = "\t")
+```
+
+#### Distribution of quantification values
+
+```{r  warning = TRUE}
+log_counts_table <- log(counts_table)
+M <- mean(colSums(counts_table)) * 1e-6
+L <- median(colSums(counts_table)) * 1e-6
+
+lcpm.cutoff <- log2(10/M + 2/L)
+
+nsamples <- ncol(log_counts_table)
+mlc <- melt(log_counts_table)
+
+p <- ggplot(aes(x=value, colour=Var2), data=mlc)
+p + geom_density()
+```
+
+Before mean normalization
+
+```{r  warning = TRUE}
+#set <- newSeqExpressionSet(as.matrix(exp_file_ruvseq),phenoData = data.frame(samples, row.names=colnames(exp_file_ruvseq)))
+set1 <- newSeqExpressionSet(as.matrix(exp_file_raw),phenoData = data.frame(samples, row.names=colnames(exp_file_raw)))
+set1
+colors <- brewer.pal(9, "Set1")
+plotRLE(set1, outline=FALSE,ylim=c(-4, 4), col=colors[as.numeric(factor(samples$individual))])
+```
+
+
+Showing that the distribution of values normalized by varianceStabilizingTransformation is appropriate
+
+```{r  warning = TRUE}
+set <- newSeqExpressionSet(as.matrix(exp_file),phenoData = data.frame(samples, row.names=colnames(exp_file)))
+set
+colors <- brewer.pal(8, "Set1")
+plotRLE(set, outline=FALSE,ylim=c(-4, 4), col=colors[as.numeric(factor(samples$individual))])
+```
+
+##### Generating PCA plots (group)
+
+```{r  warning = TRUE}
+library(ggrepel)
+set.seed(20)
+
+png(
+  "/PROJECT_DIR/RSEM_quant/PCA_grupo.png",
+  width     = 10,
+  height    = 4,
+  units     = "in",
+  res       = 1200
+)
+par(
+  mar = c(2,5,2,5),
+  cex = 1
+)
+vsd <- vst(dds, blind = TRUE)
+pca <- plotPCA(vsd, intgroup = "condition",ntop = 1000) #use only the top 1000 genes by variability
+#nudge <- position_nudge(y = 3)
+pca + geom_text_repel(size = 2,aes(label = rownames(dds@colData)), max.overlaps = Inf)
+dev.off()
+
+pca + geom_text_repel(size = 2,aes(label = rownames(dds@colData)), max.overlaps = Inf)
+```
+
+##### Generating PCA plots (TEA)
+
+```{r  warning = TRUE}
+library(ggrepel)
+set.seed(20)
+
+png(
+  "/PROJECT_DIR/RSEM_quant/PCA_DMD.png",
+  width     = 10,
+  height    = 4,
+  units     = "in",
+  res       = 1200
+)
+par(
+  mar = c(2,5,2,5),
+  cex = 1
+)
+vsd <- vst(dds, blind = TRUE)
+pca <- plotPCA(vsd, intgroup = "TEA",ntop = 1000) #use only the top 1000 genes by variability
+#nudge <- position_nudge(y = 3)
+pca + geom_text_repel(size = 2,aes(label = rownames(dds@colData)), max.overlaps = Inf)
+dev.off()
+
+pca + geom_text_repel(size = 2,aes(label = rownames(dds@colData)), max.overlaps = Inf)
+```
+
+
+##### Generating PCA plots (mutational type)
+
+```{r  warning = TRUE}
+png(
+  "/PROJECT_DIR/RSEM_quant/PCA_mut_type.png",
+  width     = 10,
+  height    = 4,
+  units     = "in",
+  res       = 1200
+)
+par(
+  mar = c(2,5,2,5),
+  cex = 1
+)
+pca <- plotPCA(vsd, intgroup = "mut_type",ntop = 1000)
+#nudge <- position_nudge(y = 3)
+pca + geom_text_repel(size = 2,aes(label = rownames(dds@colData)), max.overlaps = Inf)
+dev.off()
+
+pca + geom_text_repel(size = 2,aes(label = rownames(dds@colData)), max.overlaps = Inf)
+```
+
+-Generating PCA plots (individual)
+
+```{r  warning = TRUE}
+png(
+  "/PROJECT_DIR/RSEM_quant/PCA_sample.png",
+  width     = 10,
+  height    = 4,
+  units     = "in",
+  res       = 1200
+)
+par(
+  mar = c(2,5,2,5),
+  cex = 1
+)
+
+pca <- plotPCA(vsd, intgroup = "individual",ntop = 1000)
+#nudge <- position_nudge(y = 3)
+pca + geom_text_repel(size = 2,aes(label = rownames(dds@colData)), max.overlaps = Inf)
+dev.off()
+
+pca + geom_text_repel(size = 2,aes(label = rownames(dds@colData)), max.overlaps = Inf)
+```
+
+
+##### Generating PCA plots (cell type)
+
+```{r  warning = TRUE}
+png(
+  "/PROJECT_DIR/RSEM_quant/PCA_celltype.png",
+  width     = 10,
+  height    = 4,
+  units     = "in",
+  res       = 1200
+)
+par(
+  mar = c(2,5,2,5),
+  cex = 1
+)
+
+pca <- plotPCA(vsd, intgroup = "cell_type",ntop = 1000)
+#nudge <- position_nudge(y = 3)
+pca + geom_text_repel(size = 2,aes(label = rownames(dds@colData)), max.overlaps = Inf)
+dev.off()
+
+pca + geom_text_repel(size = 2,aes(label = rownames(dds@colData)), max.overlaps = Inf)
+```
+
+
+
+<!-- -Normalization for sequencing depth -->
+<!-- ```{r  warning = TRUE} -->
+<!-- set <- betweenLaneNormalization(set, which="upper") -->
+<!-- plotRLE(set, outline=FALSE, ylim=c(-4, 4), col=colors[as.numeric(factor(samples$individual))]) -->
+<!-- ``` -->
+<!-- -PCA with normalized data -->
+<!-- ```{r  warning = TRUE} -->
+<!-- plotPCA(set, col=colors[as.numeric(factor(samples$individual))], cex=1.2) -->
+<!-- ``` -->
+
+
+Not done because the gene symbol was already present: ###### Creating files to annotate the transcripts with gene symbols
+```{r  warning = TRUE}
+#anot <- fread(file = "/PATH/TO/ANNOTATION.gtf")
+#anot <- data.frame(anot$V9)
+#anot2 <- data.frame(do.call('rbind', strsplit(as.character(anot$anot.V9),';',fixed=TRUE)))
+#anot2 <- anot2[grep("gene_type",anot2$X2),]
+#
+#anot_table = data.frame(ensembl_gene_id = sub('[^\\"]+\\"([^\\"]+).*', '\\1', anot2$X1),
+#                        gene_name = sub('[^\\"]+\\"([^\\"]+).*', '\\1', anot2$X3))
+
+#rm(anot, anot2)
+exp_file_normalized <- as.data.frame(set@assayData$counts)
+```
+
+
+#### How is the expression of housekeeping genes and markers in these samples? First for NSC
+- General housekeeping genes:
+https://doi.org/10.1016/j.tig.2014.02.001: "C1orf43", "CHMP2A", "EMC7", "GPI", "PSMB2", "PSMB4", "RAB7A", "REEP5", "SNRPD3", "VCP", "VPS29"
+- NSC marker genes:
+"SOX2","PAX6","NES","PROM1","BMI1","EZH2","NEUROG2","ASCL1","TBR1","SLC1A3","MKI67" (chatGPT)
+- Neuron marker genes:
+"BTBD11","DISP2","GALNTL6","SERTM1","SYT13","VSTM2A","ZMAT4" (https://www.nature.com/articles/s41598-018-27293-5/tables/2)
+
+
+```{r  warning = TRUE}
+housekeeping_genes <- c("C1orf43", "CHMP2A", "EMC7", "GPI", "PSMB2", "PSMB4", "RAB7A", "REEP5", "SNRPD3", "VCP", "VPS29","SOX2","PAX6","NES","PROM1","BMI1","EZH2","NEUROG2","ASCL1","TBR1","SLC1A3","MKI67","BTBD11","DISP2","GALNTL6","SERTM1","SYT13","VSTM2A","ZMAT4")
+
+sub(".*_","",rownames(exp_file_normalized)) -> exp_file_normalized$gene_symbol
+
+dup_genes <- gsub(".*_","",rownames(exp_file_normalized))
+exp_file_normalized <- exp_file_normalized[!duplicated(dup_genes),]
+exp_file_normalized <- as.data.frame(exp_file_normalized)
+
+rownames(exp_file_normalized) <- exp_file_normalized$gene_symbol
+exp_file_normalized <- exp_file_normalized[,-19]
+write.table(exp_file_normalized, file = "/PROJECT_DIR/RSEM_quant/exp_file_symbol.tsv", row.names = FALSE, sep = "\t", quote = FALSE)
+
+hg_exp <- exp_file_normalized[rownames(exp_file_normalized) %in% housekeeping_genes,]
+hg_exp <- hg_exp[,colnames(hg_exp) %in% samples$sample[samples$cell_type == "NSC"]]
+hg_exp$genes <- rownames(hg_exp)
+hg_melt1 <- melt(hg_exp, id.vars= "genes")
+hg_melt1$value <- as.numeric(hg_melt1$value)
+hg_melt1$value[hg_melt1$value < 1] <- 1
+hg_melt1$genes <- factor(hg_melt1$genes, levels = c("C1orf43", "CHMP2A", "EMC7", "GPI", "PSMB2", "PSMB4", "RAB7A", "REEP5", "SNRPD3", "VCP", "VPS29","SOX2","PAX6","NES","PROM1","BMI1","EZH2","NEUROG2","ASCL1","TBR1","SLC1A3","MKI67","BTBD11","DISP2","GALNTL6","SERTM1","SYT13","VSTM2A","ZMAT4"))
+
+png(
+  "/PROJECT_DIR/RSEM_quant/NSC_housekeeping_genes.png",
+  width     = 18,
+  height    = 8,
+  units     = "in",
+  res       = 1200
+)
+par(
+  mar = c(2,5,2,5),
+  cex = 1
+)             
+hg_melt1%>%
+  ggplot(aes(x=genes, y=log2(value), group=variable, color=variable)) +
+    geom_line() + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+dev.off()
+
+hg_melt1%>%
+  ggplot(aes(x=genes, y=log2(value), group=variable, color=variable)) +
+    geom_line() + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+```
+
+##### How is the expression of housekeeping genes and markers in the neuron samples
+
+```{r  warning = TRUE}
+hg_exp <- exp_file_normalized[rownames(exp_file_normalized) %in% housekeeping_genes,]
+hg_exp <- hg_exp[,colnames(hg_exp) %in% samples$sample[samples$cell_type == "neuron"]]
+hg_exp$genes <- rownames(hg_exp)
+hg_melt2 <- melt(hg_exp, id.vars= "genes")
+hg_melt2$value <- as.numeric(hg_melt2$value)
+hg_melt2$value[hg_melt2$value < 1] <- 1
+hg_melt2$genes <- factor(hg_melt2$genes, levels = c("C1orf43", "CHMP2A", "EMC7", "GPI", "PSMB2", "PSMB4", "RAB7A", "REEP5", "SNRPD3", "VCP", "VPS29","SOX2","PAX6","NES","PROM1","BMI1","EZH2","NEUROG2","ASCL1","TBR1","SLC1A3","MKI67","BTBD11","DISP2","GALNTL6","SERTM1","SYT13","VSTM2A","ZMAT4"))
+
+png(
+  "/PROJECT_DIR/RSEM_quant/neuron_housekeeping_genes.png",
+  width     = 18,
+  height    = 8,
+  units     = "in",
+  res       = 1200
+)
+par(
+  mar = c(2,5,2,5),
+  cex = 1
+)             
+hg_melt2%>%
+  ggplot(aes(x=genes, y=log2(value), group=variable, color=variable)) +
+    geom_line() + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+dev.off()
+
+hg_melt2%>%
+  ggplot(aes(x=genes, y=log2(value), group=variable, color=variable)) +
+    geom_line() + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+```
+
+#### Plotting expression of important lineage genes
+I used log2 of the quantification values because some lowly expressed genes make the other values too small in comparison.
+
+#### Plotting expression of important neuronal lineage genes in neurons
+
+```{r  warning = TRUE}
+library(hrbrthemes)
+neuron_list <- read.table("/PROJECT_DIR/neuron_markers.txt")[,1]
+nsc_counts <- subset(exp_file_normalized, rownames(exp_file_normalized) %in% neuron_list)
+#nsc_counts <- nsc_counts[,colnames(nsc_counts) %in% samples$sample[samples$cell_type == "neuron"]]
+rownames(nsc_counts) -> nsc_counts$gene_name
+melted_nsc_counts <- melt(nsc_counts)
+melted_nsc_counts$value[melted_nsc_counts$value <= 1] <- 1
+
+melted_nsc_counts$variable <- factor(melted_nsc_counts$variable, levels = c("MRP-1-RNASeq025-ZymoSeq","MRP-2-RNASeq025-ZymoSeq","MRP-3-RNASeq025-ZymoSeq","MRP-4-RNASeq025-ZymoSeq","MRP-5-RNASeq025-ZymoSeq","MRP-6-RNASeq025-ZymoSeq",
+  "MRP-7-RNASeq025-ZymoSeq","MRP-8-RNASeq025-ZymoSeq","MRP-9-RNASeq025-ZymoSeq","MRP-10-RNASeq025-ZymoSeq","MRP-11-RNASeq025-ZymoSeq","MRP-12-RNASeq025-ZymoSeq",
+  "MRP-13-RNASeq025-ZymoSeq","MRP-14-RNASeq025-ZymoSeq","MRP-15-RNASeq025-ZymoSeq","MRP-16-RNASeq025-ZymoSeq","MRP-17-RNASeq025-ZymoSeq","MRP-18-RNASeq025-ZymoSeq"))
+
+png(
+  "/PROJECT_DIR/RSEM_quant/neuron_neural_lineage_genes.png",
+  width     = 18,
+  height    = 8,
+  units     = "in",
+  res       = 1200
+)
+par(
+  mar = c(2,5,2,5),
+  cex = 1
+)  
+ ggplot(melted_nsc_counts, aes(gene_name, variable, fill= log2(value))) +
+   geom_tile() +  scale_fill_viridis(discrete=FALSE) +
+   theme_ipsum() + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+ 
+ dev.off()
+ 
+ ggplot(melted_nsc_counts, aes(gene_name, variable, fill= log2(value))) +
+   geom_tile() +  scale_fill_viridis(discrete=FALSE) +
+   theme_ipsum() + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+```
+
+#### variancePartition
+Estimate how much each covariate explains the variability in expression values
+
+```{r  warning = TRUE}
+# Run the variancePartition analysis on the counts table to account for contributions of each covariate to data variability:
+
+  # First file must be the counts: genes in rows and samples in columns
+  # Second must be the metadata: all covariates for each sample
+  # Third must be the formula
+
+covariates = samples
+form = ~ age + (1|individual) + (1|cell_type) # + (1|RIN) 
+
+exp_varpart <- counts(set)
+varPart <- fitExtractVarPartModel(exp_varpart, form, covariates)
+vp <- sortCols(varPart)
+plotPercentBars(vp[1:10,])
+png("/PROJECT_DIR/RSEM_quant/allsamples_variancePartition_total.png", units="in", width=8, height=4, res=800)
+plotVarPart(vp)
+dev.off()
+plotVarPart(vp)
+```
+
+- Hierarchical clustering of expression values
+
+```{r  warning = TRUE}
+exp <- counts(dds, normalized=TRUE)
+
+sampleTree = hclust(dist(t(exp)), method = "average")
+par(mar = c(0, 0, 0, 0))
+
+traitData <- samples
+traitData$condition <- recode(traitData$condition, "control" = 0, "patient" = 1)
+traitColors = traitData$condition
+traitColors[traitColors == 0] <- "#fbaca7"
+traitColors[traitColors == 1] <- "#52d8da"
+
+png(
+  "/PROJECT_DIR/RSEM_quant/hclust_expression_data.png",
+  width     = 18,
+  height    = 8,
+  units     = "in",
+  res       = 1200
+)
+par(
+  mar = c(2,5,2,5),
+  cex = 1
+)  
+p <- plotDendroAndColors(sampleTree, traitColors,
+                    groupLabels = names(traitData$Sex),
+                    main = "Sample dendrogram (colors represent condition)")
+p
+dev.off()
+p
+```
+
+- A heatmap of this distance matrix gives us an overview of similarities and dissimilarities between samples. We have to provide a hierarchical clustering hc to the heatmap function based on the sample distances, or else the heatmap function would calculate a clustering based on the distances between the rows/columns of the distance matrix.
+
+```{r  warning = TRUE}
+sampleDists <- dist(t(assay(vsd)))
+
+library("RColorBrewer")
+sampleDistMatrix <- as.matrix(sampleDists)
+rownames(sampleDistMatrix) <- paste(vsd$condition, vsd$sample, vsd$cell_type, vsd$treatment, sep="-")
+colnames(sampleDistMatrix) <- NULL
+colors <- colorRampPalette( rev(brewer.pal(9, "Blues")) )(255)
+
+png(
+  "/PROJECT_DIR/RSEM_quant/distance_matrix_heatmap.png",
+  width     = 18,
+  height    = 8,
+  units     = "in",
+  res       = 1200
+)
+par(
+  mar = c(2,5,2,5),
+  cex = 1
+)  
+pheatmap(sampleDistMatrix,
+         clustering_distance_rows=sampleDists,
+         clustering_distance_cols=sampleDists,
+         col=colors)
+dev.off()
+
+pheatmap(sampleDistMatrix,
+         clustering_distance_rows=sampleDists,
+         clustering_distance_cols=sampleDists,
+         col=colors)
+```
+
+- Looking at the top 20 most expressed genes:
+
+```{r  warning = TRUE}
+ntd <- normTransform(dds)
+select <- order(rowMeans(counts(dds,normalized=TRUE)),
+                decreasing=TRUE)[1:20]
+df <- as.data.frame(colData(dds)[,c("condition","cell_type")])
+
+png(
+  "/PROJECT_DIR/RSEM_quant/top20_heatmap.png",
+  width     = 18,
+  height    = 8,
+  units     = "in",
+  res       = 1200
+)
+par(
+  mar = c(2,5,2,5),
+  cex = 1
+)  
+pheatmap(assay(ntd)[select,], cluster_rows=FALSE, show_rownames=T,
+         cluster_cols=FALSE, annotation_col=df)
+dev.off()
+
+pheatmap(assay(ntd)[select,], cluster_rows=FALSE, show_rownames=T,
+         cluster_cols=FALSE, annotation_col=df)
+```
