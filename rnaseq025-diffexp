@@ -1,0 +1,1012 @@
+---
+title: "RNAseq025_diffexp"
+author: "Victor Toledo"
+date: "2025-01-20"
+output: html_document
+---
+
+```{r  message = FALSE, warning = FALSE}
+options(stringsAsFactors = FALSE)
+
+setwd("/PROJECT_DIR/diff_exp")
+
+library(DESeq2)
+#library(hrbrthemes)
+library(tximport)
+library(tidyverse)
+library(pheatmap)
+library(viridis)
+library(rmarkdown)
+library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+library(biomaRt)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(ReactomePA)
+library(ggplot2)
+library(reshape2)
+library(edgeR)
+library(SummarizedExperiment)
+#library(WGCNA)
+library(variancePartition)
+#library(RUVSeq)
+library(RColorBrewer)
+library(EDASeq)
+library(tibble)
+library(dplyr)
+library(tidyr)
+library(fgsea)
+#library(ComplexHeatmap)
+library(circlize)
+library(data.table)
+library(ggrepel)
+```
+
+## Differential expression in NSC cells: control x DMD "pure"
+
+Controls: F07007, F014932, F012262-4  
+DMD patients without TEA: C023903, C026484, F012161-1
+
+```{r  warning = TRUE}
+# build the samples manually to change everything easily
+setwd("/PROJECT_DIR/RSEM_quant/")
+samples <- data.frame(sample = as.factor(gsub("(.+?)(\\_.*)", "\\1", list.files(pattern = ".genes.results"))),
+                      condition=c("control","control","control","control",rep("patient",6),rep("control",2),rep("patient",6)),
+                      mut_type=c(rep("none",4),"duplication","deletion","deletion","indel","deletion","snv",
+                                 "none","none","duplication","deletion","deletion","indel","deletion","snv"),
+                      TEA=c(rep("no",7),rep("yes",3),rep("no",5),rep("yes",3)),
+                      individual=c("F07007","F07007","F014932","F012262-4","C023903","C026484","F012161-1","C026023","F012161-4",
+                                   "C026786","F014932","F012262-4","C023903","C026484","F012161-1","C026023","F012161-4","C026786"),
+                      new_name=c("C1","C1","C2","C3","P1","P2","P3","P4","P5","P6","C2","C3","P1","P2","P3","P4","P5","P6"),
+                      age=c(27,27,25,9,16,20,20,15,20,14,25,9,16,20,20,15,20,14),
+                      cell_type=c("NSC",rep("neuron",9),rep("NSC",8)))
+samples$data <- paste(samples$new_name,samples$cell_type,sep="_")
+#samples$group <- paste(samples$DMD_condition,samples$TEA,sep="")
+
+files <- list.files(pattern = ".genes.results")
+names(files) <- samples$sample
+all(file.exists(files))
+
+setwd("/PROJECT_DIR/RSEM_quant/")
+
+samples_nsc <- samples[samples$cell_type == "NSC",]
+
+samples_nsc1 <- samples_nsc[1:6,] 
+
+files_nsc1 <- files[c(1,11:15)]
+all(file.exists(files_nsc1))
+
+txi = tximport(files_nsc1, type = "rsem", txIn = FALSE, txOut = FALSE)
+# we tested two lengths (0.01 and 1) and the results were different
+txi$length[txi$length == 0] = 1
+
+ddsColl <- DESeqDataSetFromTximport(txi, colData = samples_nsc1, design = ~condition)
+
+#ddsColl <- collapseReplicates(dds, dds$individual, dds$sample)
+
+smallestGroupSize <- 3
+keep <- rowSums(counts(ddsColl) >= 250) >= smallestGroupSize
+table(keep)
+ddsColl <- ddsColl[keep,]
+ddsColl <- DESeq(ddsColl)
+resultsNames(ddsColl)
+res_noShrink <- results(ddsColl, name="condition_patient_vs_control",alpha = 0.05)
+summary(res_noShrink)
+
+# shrinkage of effect size (LFC estimates) is useful for visualization and ranking of genes.
+res <- lfcShrink(ddsColl, coef ="condition_patient_vs_control", type = "apeglm", svalue = T)
+summary(res)
+```
+
+```{r  warning = TRUE}
+# From the results() function to get the outlier genes
+m <- nrow(attr(ddsColl, "dispModelMatrix"))
+p <- ncol(attr(ddsColl, "dispModelMatrix"))
+cooksCutoff <- qf(0.99, p, m - p)
+cooksOutlier <- mcols(ddsColl)$maxCooks > cooksCutoff
+
+w <- which(cooksOutlier)
+
+# these are the outliers, four as reported in summary(res)
+rownames(ddsColl)[w]
+```
+
+```{r  warning = TRUE}
+formated_res <- as.data.frame(res) %>%
+  rownames_to_column("gene") %>%
+  arrange(desc(abs(log2FoldChange))) %>%
+  mutate(significative = if_else(svalue < 0.005, "yes", "no")) %>%
+  mutate(up = if_else(log2FoldChange < 0, "control", "patient"))
+#formated_res <- merge(formated_res, anot_table, by.x = "gene", by.y = "ensembl_gene_id", all.x = T)
+paged_table(formated_res)
+
+formated_res_noShrink <- as.data.frame(res_noShrink) %>%
+  rownames_to_column("gene") %>%
+  arrange(desc(abs(log2FoldChange))) %>%
+  mutate(significative = if_else(padj < 0.05, "yes", "no")) %>%
+  mutate(up = if_else(log2FoldChange < 0, "control", "patient"))
+##formated_res_noShrink <- merge(formated_res_noShrink, anot_table, by.x = "gene", by.y = "ensembl_gene_id", all.x = T)
+
+paged_table(formated_res)
+
+formated_res$symbol <- gsub(".*_","",formated_res$gene)
+formated_res_noShrink$symbol <- gsub(".*_","",formated_res_noShrink$gene)
+
+NSC_control_nTEA_sig <- formated_res[formated_res$significative == "yes",]
+NSC_control_nTEA_downreg <- NSC_control_nTEA_sig[NSC_control_nTEA_sig$up == "control",]
+NSC_control_nTEA_upreg <- NSC_control_nTEA_sig[NSC_control_nTEA_sig$up == "patient",]
+
+write.table(formated_res, file = "/PROJECT_DIR/diff_exp/NSC_control_nTEA_shrink_results.txt", row.names = FALSE, sep = "\t", quote = FALSE)
+write.table(NSC_control_nTEA_downreg, file = "/PROJECT_DIR/diff_exp/NSC_control_nTEA_downreg_shrink_results.txt", row.names = FALSE, sep = "\t", quote = FALSE)
+write.table(NSC_control_nTEA_upreg, file = "/PROJECT_DIR/diff_exp/NSC_control_nTEA_upreg_shrink_results.txt", row.names = FALSE, sep = "\t", quote = FALSE)
+write.table(formated_res_noShrink, file = "/PROJECT_DIR/diff_exp/NSC_control_nTEA_results.txt", row.names = FALSE, sep = "\t", quote = FALSE)
+```
+
+- Distribution of quantification values  
+Showing that the distribution of values normalized by varianceStabilizingTransformation is appropriate
+
+```{r  warning = TRUE}
+NSC_control_nTEA_exp <- as.data.frame(counts(ddsColl, normalized = TRUE))
+set <- newSeqExpressionSet(as.matrix(NSC_control_nTEA_exp),phenoData = data.frame(samples_nsc1, row.names=colnames(NSC_control_nTEA_exp)))
+set
+colors <- brewer.pal(8, "Set1")
+plotRLE(set, outline=FALSE,ylim=c(-2, 2), col=colors[as.numeric(factor(samples_nsc1$individual))])
+```
+
+- MA plot shows the mean of the normalized counts vs log2 fold changes for all tested genes
+
+```{r  warning = TRUE}
+DESeq2::plotMA(res)
+```
+
+- Standard deviation of the transformed data across samples, against the mean, using the shifted logarithm transformation, the regularized log transformation, and the variance stabilizing transformation
+
+```{r  warning = TRUE}
+library("vsn")
+vsd <- vst(ddsColl, blind = TRUE)
+meanSdPlot(assay(vsd))
+```
+
+- Generating PCA plots (group)
+
+```{r  warning = TRUE}
+png(
+  "/PROJECT_DIR/diff_exp/NSC_control_nTEA_PCA_grupo.png",
+  width     = 10,
+  height    = 4,
+  units     = "in",
+  res       = 1200
+)
+par(
+  mar = c(2,5,2,5),
+  cex = 1
+)
+pca <- plotPCA(vsd, intgroup = "condition",ntop = 1000) #use only the top 1000 genes by variability
+#nudge <- position_nudge(y = 3)
+pca + geom_text_repel(size = 3,aes(label = rownames(ddsColl@colData)), max.overlaps = Inf)
+dev.off()
+
+pca + geom_text_repel(size = 3,aes(label = rownames(ddsColl@colData)), max.overlaps = Inf)
+```
+
+- Generating PCA plots (age)
+
+```{r  warning = TRUE}
+png(
+  "/PROJECT_DIR/diff_exp/NSC_control_nTEA_PCA_gene.png",
+  width     = 10,
+  height    = 4,
+  units     = "in",
+  res       = 1200
+)
+par(
+  mar = c(2,5,2,5),
+  cex = 1
+)
+vsd <- vst(ddsColl, blind = TRUE)
+pca <- plotPCA(vsd, intgroup = "age",ntop = 1000)
+#nudge <- position_nudge(y = 3)
+pca + geom_text_repel(size = 3,aes(label = rownames(ddsColl@colData)), max.overlaps = Inf)
+dev.off()
+
+pca + geom_text_repel(size = 3,aes(label = rownames(ddsColl@colData)), max.overlaps = Inf)
+```
+
+- Heatmap of normalized expression
+
+```{r  warning = TRUE}
+normalized_counts <- counts(ddsColl, normalized=TRUE)
+
+#make the DeseQ results as data Frame
+res_table_NSC_control_nTEA_df <- as.data.frame(res)
+sig_NSC_control_nTEA <- data.frame(subset(res_table_NSC_control_nTEA_df, res_table_NSC_control_nTEA_df$svalue < 0.25))
+norm_NSC_control_nTEA <- normalized_counts[row.names(sig_NSC_control_nTEA),]
+
+annotation <- data.frame(sampletype=samples_nsc1[,'condition'],
+                         row.names=colnames(norm_NSC_control_nTEA))#,
+                         #gene_mut=samples[,'gene_mut'])
+
+png(
+  "/PROJECT_DIR/diff_exp/NSC_control_nTEA_heatmap.png",
+  width     = 18,
+  height    = 8,
+  units     = "in",
+  res       = 1200
+)
+par(
+  mar = c(2,5,2,5),
+  cex = 1
+)  
+heat.colors <- brewer.pal(6, "RdYlBu")
+pheatmap(norm_NSC_control_nTEA, color = heat.colors, cluster_rows = T, show_rownames=F,
+         annotation= annotation, border_color=NA, fontsize = 10, scale="row",
+         fontsize_row = 10, height=20)
+dev.off()
+
+pheatmap(norm_NSC_control_nTEA, color = heat.colors, cluster_rows = T, show_rownames=F,
+         annotation= annotation, border_color=NA, fontsize = 10, scale="row",
+         fontsize_row = 10, height=20)
+```
+
+## Differential expression in NSC cells: control x DMD with TEA
+
+Controls: F07007, F014932, F012262-4  
+DMD patients with TEA: C026023, F012161-4, C026786
+
+```{r  warning = TRUE}
+setwd("/PROJECT_DIR/RSEM_quant/")
+
+samples_nsc <- samples[samples$cell_type == "NSC",]
+
+samples_nsc2 <- samples_nsc[c(1:3,7:9),] 
+
+files_nsc2 <- files[c(1,11:12,16:18)]
+all(file.exists(files_nsc2))
+
+txi = tximport(files_nsc2, type = "rsem", txIn = FALSE, txOut = FALSE)
+# we tested two lengths (0.01 and 1) and the results were different
+txi$length[txi$length == 0] = 1
+
+ddsColl <- DESeqDataSetFromTximport(txi, colData = samples_nsc2, design = ~condition)
+
+#ddsColl <- collapseReplicates(dds, dds$individual, dds$sample)
+
+smallestGroupSize <- 3
+keep <- rowSums(counts(ddsColl) >= 10) >= smallestGroupSize
+ddsColl <- ddsColl[keep,]
+ddsColl <- DESeq(ddsColl)
+resultsNames(ddsColl)
+res_noShrink <- results(ddsColl, name="condition_patient_vs_control",alpha = 0.05)
+summary(res_noShrink)
+
+# shrinkage of effect size (LFC estimates) is useful for visualization and ranking of genes.
+res <- lfcShrink(ddsColl, coef ="condition_patient_vs_control", type = "apeglm", svalue = T, lfcThreshold = 0.1)
+summary(res)
+```
+
+```{r  warning = TRUE}
+formated_res <- as.data.frame(res) %>%
+  rownames_to_column("gene") %>%
+  arrange(desc(abs(log2FoldChange))) %>%
+  mutate(significative = if_else(svalue < 0.005, "yes", "no")) %>%
+  mutate(up = if_else(log2FoldChange < 0, "control", "patient"))
+#formated_res <- merge(formated_res, anot_table, by.x = "gene", by.y = "ensembl_gene_id", all.x = T)
+paged_table(formated_res)
+
+formated_res_noShrink <- as.data.frame(res_noShrink) %>%
+  rownames_to_column("gene") %>%
+  arrange(desc(abs(log2FoldChange))) %>%
+  mutate(significative = if_else(padj < 0.05, "yes", "no")) %>%
+  mutate(up = if_else(log2FoldChange < 0, "control", "patient"))
+##formated_res_noShrink <- merge(formated_res_noShrink, anot_table, by.x = "gene", by.y = "ensembl_gene_id", all.x = T)
+
+paged_table(formated_res)
+
+formated_res$symbol <- gsub(".*_","",formated_res$gene)
+formated_res_noShrink$symbol <- gsub(".*_","",formated_res_noShrink$gene)
+
+NSC_control_yTEA_sig <- formated_res[formated_res$significative == "yes",]
+NSC_control_yTEA_downreg <- NSC_control_yTEA_sig[NSC_control_yTEA_sig$up == "control",]
+NSC_control_yTEA_upreg <- NSC_control_yTEA_sig[NSC_control_yTEA_sig$up == "patient",]
+
+write.table(formated_res, file = "/PROJECT_DIR/diff_exp/NSC_control_yTEA_shrink_results.txt", row.names = FALSE, sep = "\t", quote = FALSE)
+write.table(NSC_control_yTEA_downreg, file = "/PROJECT_DIR/diff_exp/NSC_control_yTEA_downreg_shrink_results.txt", row.names = FALSE, sep = "\t", quote = FALSE)
+write.table(NSC_control_yTEA_upreg, file = "/PROJECT_DIR/diff_exp/NSC_control_yTEA_upreg_shrink_results.txt", row.names = FALSE, sep = "\t", quote = FALSE)
+write.table(formated_res_noShrink, file = "/PROJECT_DIR/diff_exp/NSC_control_yTEA_results.txt", row.names = FALSE, sep = "\t", quote = FALSE)
+```
+
+- Distribution of quantification values  
+Showing that the distribution of values normalized by varianceStabilizingTransformation is appropriate
+
+```{r  warning = TRUE}
+NSC_control_yTEA_exp <- as.data.frame(counts(ddsColl, normalized = TRUE))
+set <- newSeqExpressionSet(as.matrix(NSC_control_yTEA_exp),phenoData = data.frame(samples_nsc1, row.names=colnames(NSC_control_yTEA_exp)))
+set
+colors <- brewer.pal(8, "Set1")
+plotRLE(set, outline=FALSE,ylim=c(-2, 2), col=colors[as.numeric(factor(samples_nsc1$individual))])
+```
+
+- MA plot shows the mean of the normalized counts vs log2 fold changes for all tested genes
+
+```{r  warning = TRUE}
+DESeq2::plotMA(res)
+```
+
+- Standard deviation of the transformed data across samples, against the mean, using the shifted logarithm transformation, the regularized log transformation, and the variance stabilizing transformation
+
+```{r  warning = TRUE}
+library("vsn")
+vsd <- vst(ddsColl, blind = TRUE)
+meanSdPlot(assay(vsd))
+```
+
+- Generating PCA plots (group)
+
+```{r  warning = TRUE}
+png(
+  "/PROJECT_DIR/diff_exp/NSC_control_yTEA_PCA_grupo.png",
+  width     = 10,
+  height    = 4,
+  units     = "in",
+  res       = 1200
+)
+par(
+  mar = c(2,5,2,5),
+  cex = 1
+)
+pca <- plotPCA(vsd, intgroup = "condition",ntop = 1000) #use only the top 1000 genes by variability
+#nudge <- position_nudge(y = 3)
+pca + geom_text_repel(size = 3,aes(label = rownames(ddsColl@colData)), max.overlaps = Inf)
+dev.off()
+
+pca + geom_text_repel(size = 3,aes(label = rownames(ddsColl@colData)), max.overlaps = Inf)
+```
+
+- Generating PCA plots (age)
+
+```{r  warning = TRUE}
+png(
+  "/PROJECT_DIR/diff_exp/NSC_control_yTEA_PCA_gene.png",
+  width     = 10,
+  height    = 4,
+  units     = "in",
+  res       = 1200
+)
+par(
+  mar = c(2,5,2,5),
+  cex = 1
+)
+vsd <- vst(ddsColl, blind = TRUE)
+pca <- plotPCA(vsd, intgroup = "age",ntop = 1000)
+#nudge <- position_nudge(y = 3)
+pca + geom_text_repel(size = 3,aes(label = rownames(ddsColl@colData)), max.overlaps = Inf)
+dev.off()
+
+pca + geom_text_repel(size = 3,aes(label = rownames(ddsColl@colData)), max.overlaps = Inf)
+```
+
+- Heatmap of normalized expression
+
+```{r  warning = TRUE}
+normalized_counts <- counts(ddsColl, normalized=TRUE)
+
+#make the DeseQ results as data Frame
+res_table_NSC_control_yTEA_df <- as.data.frame(res)
+sig_NSC_control_yTEA <- data.frame(subset(res_table_NSC_control_yTEA_df, res_table_NSC_control_yTEA_df$svalue < 0.25))
+norm_NSC_control_yTEA <- normalized_counts[row.names(sig_NSC_control_yTEA),]
+
+annotation <- data.frame(sampletype=samples_nsc1[,'condition'],
+                         row.names=colnames(norm_NSC_control_yTEA))#,
+                         #gene_mut=samples[,'gene_mut'])
+
+png(
+  "/PROJECT_DIR/diff_exp/NSC_control_yTEA_heatmap.png",
+  width     = 18,
+  height    = 8,
+  units     = "in",
+  res       = 1200
+)
+par(
+  mar = c(2,5,2,5),
+  cex = 1
+)  
+heat.colors <- brewer.pal(6, "RdYlBu")
+pheatmap(norm_NSC_control_yTEA, color = heat.colors, cluster_rows = T, show_rownames=F,
+         annotation= annotation, border_color=NA, fontsize = 10, scale="row",
+         fontsize_row = 10, height=20)
+dev.off()
+
+pheatmap(norm_NSC_control_yTEA, color = heat.colors, cluster_rows = T, show_rownames=F,
+         annotation= annotation, border_color=NA, fontsize = 10, scale="row",
+         fontsize_row = 10, height=20)
+```
+
+## Differential expression in neuron cells: control x DMD "pure"
+
+Controls: F07007, F014932, F012262-4  
+DMD patients without TEA: C023903, C026484, F012161-1
+
+```{r  warning = TRUE}
+setwd("/PROJECT_DIR/RSEM_quant/")
+
+samples_neuron <- samples[samples$cell_type == "neuron",]
+
+samples_neuron1 <- samples_neuron[1:6,] 
+
+files_neuron1 <- files[c(2:7)]
+all(file.exists(files_neuron1))
+
+txi = tximport(files_neuron1, type = "rsem", txIn = FALSE, txOut = FALSE)
+# we tested two lengths (0.01 and 1) and the results were different
+txi$length[txi$length == 0] = 1
+
+ddsColl <- DESeqDataSetFromTximport(txi, colData = samples_neuron1, design = ~condition)
+
+#ddsColl <- collapseReplicates(dds, dds$individual, dds$sample)
+
+smallestGroupSize <- 3
+keep <- rowSums(counts(ddsColl) >= 10) >= smallestGroupSize
+ddsColl <- ddsColl[keep,]
+ddsColl <- DESeq(ddsColl)
+resultsNames(ddsColl)
+res_noShrink <- results(ddsColl, name="condition_patient_vs_control",alpha = 0.05)
+summary(res_noShrink)
+
+# shrinkage of effect size (LFC estimates) is useful for visualization and ranking of genes.
+res <- lfcShrink(ddsColl, coef ="condition_patient_vs_control", type = "apeglm", svalue = T)
+summary(res)
+```
+
+```{r  warning = TRUE}
+formated_res <- as.data.frame(res) %>%
+  rownames_to_column("gene") %>%
+  arrange(desc(abs(log2FoldChange))) %>%
+  mutate(significative = if_else(svalue < 0.005, "yes", "no")) %>%
+  mutate(up = if_else(log2FoldChange < 0, "control", "patient"))
+#formated_res <- merge(formated_res, anot_table, by.x = "gene", by.y = "ensembl_gene_id", all.x = T)
+paged_table(formated_res)
+
+formated_res_noShrink <- as.data.frame(res_noShrink) %>%
+  rownames_to_column("gene") %>%
+  arrange(desc(abs(log2FoldChange))) %>%
+  mutate(significative = if_else(padj < 0.05, "yes", "no")) %>%
+  mutate(up = if_else(log2FoldChange < 0, "control", "patient"))
+##formated_res_noShrink <- merge(formated_res_noShrink, anot_table, by.x = "gene", by.y = "ensembl_gene_id", all.x = T)
+
+paged_table(formated_res)
+
+formated_res$symbol <- gsub(".*_","",formated_res$gene)
+formated_res_noShrink$symbol <- gsub(".*_","",formated_res_noShrink$gene)
+
+neuron_control_nTEA_sig <- formated_res[formated_res$significative == "yes",]
+neuron_control_nTEA_downreg <- neuron_control_nTEA_sig[neuron_control_nTEA_sig$up == "control",]
+neuron_control_nTEA_upreg <- neuron_control_nTEA_sig[neuron_control_nTEA_sig$up == "patient",]
+
+write.table(formated_res, file = "/PROJECT_DIR/diff_exp/neuron_control_nTEA_shrink_results.txt", row.names = FALSE, sep = "\t", quote = FALSE)
+write.table(neuron_control_nTEA_downreg, file = "/PROJECT_DIR/diff_exp/neuron_control_nTEA_downreg_shrink_results.txt", row.names = FALSE, sep = "\t", quote = FALSE)
+write.table(neuron_control_nTEA_upreg, file = "/PROJECT_DIR/diff_exp/neuron_control_nTEA_upreg_shrink_results.txt", row.names = FALSE, sep = "\t", quote = FALSE)
+write.table(formated_res_noShrink, file = "/PROJECT_DIR/diff_exp/neuron_control_nTEA_results.txt", row.names = FALSE, sep = "\t", quote = FALSE)
+```
+
+- Distribution of quantification values  
+Showing that the distribution of values normalized by varianceStabilizingTransformation is appropriate
+
+```{r  warning = TRUE}
+neuron_control_nTEA_exp <- as.data.frame(counts(ddsColl, normalized = TRUE))
+set <- newSeqExpressionSet(as.matrix(neuron_control_nTEA_exp),phenoData = data.frame(samples_neuron1, row.names=colnames(neuron_control_nTEA_exp)))
+set
+colors <- brewer.pal(8, "Set1")
+plotRLE(set, outline=FALSE,ylim=c(-2, 2), col=colors[as.numeric(factor(samples_neuron1$individual))])
+```
+
+- MA plot shows the mean of the normalized counts vs log2 fold changes for all tested genes
+
+```{r  warning = TRUE}
+DESeq2::plotMA(res)
+```
+
+- Standard deviation of the transformed data across samples, against the mean, using the shifted logarithm transformation, the regularized log transformation, and the variance stabilizing transformation
+
+```{r  warning = TRUE}
+library("vsn")
+vsd <- vst(ddsColl, blind = TRUE)
+meanSdPlot(assay(vsd))
+```
+
+- Generating PCA plots (group)
+
+```{r  warning = TRUE}
+png(
+  "/PROJECT_DIR/diff_exp/neuron_control_nTEA_PCA_grupo.png",
+  width     = 10,
+  height    = 4,
+  units     = "in",
+  res       = 1200
+)
+par(
+  mar = c(2,5,2,5),
+  cex = 1
+)
+pca <- plotPCA(vsd, intgroup = "condition",ntop = 1000) #use only the top 1000 genes by variability
+#nudge <- position_nudge(y = 3)
+pca + geom_text_repel(size = 3,aes(label = rownames(ddsColl@colData)), max.overlaps = Inf)
+dev.off()
+
+pca + geom_text_repel(size = 3,aes(label = rownames(ddsColl@colData)), max.overlaps = Inf)
+```
+
+- Generating PCA plots (age)
+
+```{r  warning = TRUE}
+png(
+  "/PROJECT_DIR/diff_exp/neuron_control_nTEA_PCA_gene.png",
+  width     = 10,
+  height    = 4,
+  units     = "in",
+  res       = 1200
+)
+par(
+  mar = c(2,5,2,5),
+  cex = 1
+)
+vsd <- vst(ddsColl, blind = TRUE)
+pca <- plotPCA(vsd, intgroup = "age",ntop = 1000)
+#nudge <- position_nudge(y = 3)
+pca + geom_text_repel(size = 3,aes(label = rownames(ddsColl@colData)), max.overlaps = Inf)
+dev.off()
+
+pca + geom_text_repel(size = 3,aes(label = rownames(ddsColl@colData)), max.overlaps = Inf)
+```
+
+- Heatmap of normalized expression
+
+```{r  warning = TRUE}
+normalized_counts <- counts(ddsColl, normalized=TRUE)
+
+#make the DeseQ results as data Frame
+res_table_neuron_control_nTEA_df <- as.data.frame(res)
+sig_neuron_control_nTEA <- data.frame(subset(res_table_neuron_control_nTEA_df, res_table_neuron_control_nTEA_df$svalue < 0.25))
+norm_neuron_control_nTEA <- normalized_counts[row.names(sig_neuron_control_nTEA),]
+
+annotation <- data.frame(sampletype=samples_neuron1[,'condition'],
+                         row.names=colnames(norm_neuron_control_nTEA))#,
+                         #gene_mut=samples[,'gene_mut'])
+
+png(
+  "/PROJECT_DIR/diff_exp/neuron_control_nTEA_heatmap.png",
+  width     = 18,
+  height    = 8,
+  units     = "in",
+  res       = 1200
+)
+par(
+  mar = c(2,5,2,5),
+  cex = 1
+)  
+heat.colors <- brewer.pal(6, "RdYlBu")
+pheatmap(norm_neuron_control_nTEA, color = heat.colors, cluster_rows = T, show_rownames=F,
+         annotation= annotation, border_color=NA, fontsize = 10, scale="row",
+         fontsize_row = 10, height=20)
+dev.off()
+
+pheatmap(norm_neuron_control_nTEA, color = heat.colors, cluster_rows = T, show_rownames=F,
+         annotation= annotation, border_color=NA, fontsize = 10, scale="row",
+         fontsize_row = 10, height=20)
+```
+
+## Differential expression in neuron cells: control x DMD with TEA
+
+Controls: F07007, F014932, F012262-4  
+DMD patients with TEA: C026023, F012161-4, C026786
+
+```{r  warning = TRUE}
+setwd("/PROJECT_DIR/RSEM_quant/")
+
+samples_neuron <- samples[samples$cell_type == "neuron",]
+
+samples_neuron2 <- samples_neuron[c(1:3,7:9),] 
+
+files_neuron2 <- files[c(2:4,8:10)]
+all(file.exists(files_neuron2))
+
+txi = tximport(files_neuron2, type = "rsem", txIn = FALSE, txOut = FALSE)
+# we tested two lengths (0.01 and 1) and the results were different
+txi$length[txi$length == 0] = 1
+
+ddsColl <- DESeqDataSetFromTximport(txi, colData = samples_neuron2, design = ~condition)
+
+#ddsColl <- collapseReplicates(dds, dds$individual, dds$sample)
+
+smallestGroupSize <- 3
+keep <- rowSums(counts(ddsColl) >= 10) >= smallestGroupSize
+ddsColl <- ddsColl[keep,]
+ddsColl <- DESeq(ddsColl)
+resultsNames(ddsColl)
+res_noShrink <- results(ddsColl, name="condition_patient_vs_control",alpha = 0.05)
+summary(res_noShrink)
+
+# shrinkage of effect size (LFC estimates) is useful for visualization and ranking of genes.
+res <- lfcShrink(ddsColl, coef ="condition_patient_vs_control", type = "apeglm", svalue = T)
+summary(res)
+```
+
+```{r  warning = TRUE}
+formated_res <- as.data.frame(res) %>%
+  rownames_to_column("gene") %>%
+  arrange(desc(abs(log2FoldChange))) %>%
+  mutate(significative = if_else(svalue < 0.005, "yes", "no")) %>%
+  mutate(up = if_else(log2FoldChange < 0, "control", "patient"))
+#formated_res <- merge(formated_res, anot_table, by.x = "gene", by.y = "ensembl_gene_id", all.x = T)
+paged_table(formated_res)
+
+formated_res_noShrink <- as.data.frame(res_noShrink) %>%
+  rownames_to_column("gene") %>%
+  arrange(desc(abs(log2FoldChange))) %>%
+  mutate(significative = if_else(padj < 0.05, "yes", "no")) %>%
+  mutate(up = if_else(log2FoldChange < 0, "control", "patient"))
+##formated_res_noShrink <- merge(formated_res_noShrink, anot_table, by.x = "gene", by.y = "ensembl_gene_id", all.x = T)
+
+paged_table(formated_res)
+
+formated_res$symbol <- gsub(".*_","",formated_res$gene)
+formated_res_noShrink$symbol <- gsub(".*_","",formated_res_noShrink$gene)
+
+neuron_control_yTEA_sig <- formated_res[formated_res$significative == "yes",]
+neuron_control_yTEA_downreg <- neuron_control_yTEA_sig[neuron_control_yTEA_sig$up == "control",]
+neuron_control_yTEA_upreg <- neuron_control_yTEA_sig[neuron_control_yTEA_sig$up == "patient",]
+
+write.table(formated_res, file = "/PROJECT_DIR/diff_exp/neuron_control_yTEA_shrink_results.txt", row.names = FALSE, sep = "\t", quote = FALSE)
+write.table(neuron_control_yTEA_downreg, file = "/PROJECT_DIR/diff_exp/neuron_control_yTEA_downreg_shrink_results.txt", row.names = FALSE, sep = "\t", quote = FALSE)
+write.table(neuron_control_yTEA_upreg, file = "/PROJECT_DIR/diff_exp/neuron_control_yTEA_upreg_shrink_results.txt", row.names = FALSE, sep = "\t", quote = FALSE)
+write.table(formated_res_noShrink, file = "/PROJECT_DIR/diff_exp/neuron_control_yTEA_results.txt", row.names = FALSE, sep = "\t", quote = FALSE)
+```
+
+- Distribution of quantification values  
+Showing that the distribution of values normalized by varianceStabilizingTransformation is appropriate
+
+```{r  warning = TRUE}
+neuron_control_yTEA_exp <- as.data.frame(counts(ddsColl, normalized = TRUE))
+set <- newSeqExpressionSet(as.matrix(neuron_control_yTEA_exp),phenoData = data.frame(samples_neuron1, row.names=colnames(neuron_control_yTEA_exp)))
+set
+colors <- brewer.pal(8, "Set1")
+plotRLE(set, outline=FALSE,ylim=c(-2, 2), col=colors[as.numeric(factor(samples_neuron1$individual))])
+```
+
+- MA plot shows the mean of the normalized counts vs log2 fold changes for all tested genes
+
+```{r  warning = TRUE}
+DESeq2::plotMA(res)
+```
+
+- Standard deviation of the transformed data across samples, against the mean, using the shifted logarithm transformation, the regularized log transformation, and the variance stabilizing transformation
+
+```{r  warning = TRUE}
+library("vsn")
+vsd <- vst(ddsColl, blind = TRUE)
+meanSdPlot(assay(vsd))
+```
+
+- Generating PCA plots (group)
+
+```{r  warning = TRUE}
+png(
+  "/PROJECT_DIR/diff_exp/neuron_control_yTEA_PCA_grupo.png",
+  width     = 10,
+  height    = 4,
+  units     = "in",
+  res       = 1200
+)
+par(
+  mar = c(2,5,2,5),
+  cex = 1
+)
+pca <- plotPCA(vsd, intgroup = "condition",ntop = 1000) #use only the top 1000 genes by variability
+#nudge <- position_nudge(y = 3)
+pca + geom_text_repel(size = 3,aes(label = rownames(ddsColl@colData)), max.overlaps = Inf)
+dev.off()
+
+pca + geom_text_repel(size = 3,aes(label = rownames(ddsColl@colData)), max.overlaps = Inf)
+```
+
+- Generating PCA plots (age)
+
+```{r  warning = TRUE}
+png(
+  "/PROJECT_DIR/diff_exp/neuron_control_yTEA_PCA_gene.png",
+  width     = 10,
+  height    = 4,
+  units     = "in",
+  res       = 1200
+)
+par(
+  mar = c(2,5,2,5),
+  cex = 1
+)
+vsd <- vst(ddsColl, blind = TRUE)
+pca <- plotPCA(vsd, intgroup = "age",ntop = 1000)
+#nudge <- position_nudge(y = 3)
+pca + geom_text_repel(size = 3,aes(label = rownames(ddsColl@colData)), max.overlaps = Inf)
+dev.off()
+
+pca + geom_text_repel(size = 3,aes(label = rownames(ddsColl@colData)), max.overlaps = Inf)
+```
+
+- Heatmap of normalized expression
+
+```{r  warning = TRUE}
+normalized_counts <- counts(ddsColl, normalized=TRUE)
+
+#make the DeseQ results as data Frame
+res_table_neuron_control_yTEA_df <- as.data.frame(res)
+sig_neuron_control_yTEA <- data.frame(subset(res_table_neuron_control_yTEA_df, res_table_neuron_control_yTEA_df$svalue < 0.25))
+norm_neuron_control_yTEA <- normalized_counts[row.names(sig_neuron_control_yTEA),]
+
+annotation <- data.frame(sampletype=samples_neuron1[,'condition'],
+                         row.names=colnames(norm_neuron_control_yTEA))#,
+                         #gene_mut=samples[,'gene_mut'])
+
+png(
+  "/PROJECT_DIR/diff_exp/neuron_control_yTEA_heatmap.png",
+  width     = 18,
+  height    = 8,
+  units     = "in",
+  res       = 1200
+)
+par(
+  mar = c(2,5,2,5),
+  cex = 1
+)  
+heat.colors <- brewer.pal(6, "RdYlBu")
+pheatmap(norm_neuron_control_yTEA, color = heat.colors, cluster_rows = T, show_rownames=F,
+         annotation= annotation, border_color=NA, fontsize = 10, scale="row",
+         fontsize_row = 10, height=20)
+dev.off()
+
+pheatmap(norm_neuron_control_yTEA, color = heat.colors, cluster_rows = T, show_rownames=F,
+         annotation= annotation, border_color=NA, fontsize = 10, scale="row",
+         fontsize_row = 10, height=20)
+```
+
+## Differential expression in neuron cells: DMD without TEA x DMD with TEA
+
+Controls: F07007, F014932, F012262-4  
+DMD patients with TEA: C026023, F012161-4, C026786
+
+```{r  warning = TRUE}
+setwd("/PROJECT_DIR/RSEM_quant/")
+
+samples_neuron <- samples[samples$cell_type == "neuron",]
+
+samples_neuron3 <- samples_neuron[4:9,] 
+
+files_neuron3 <- files[c(5:10)]
+all(file.exists(files_neuron3))
+
+txi = tximport(files_neuron3, type = "rsem", txIn = FALSE, txOut = FALSE)
+# we tested two lengths (0.01 and 1) and the results were different
+txi$length[txi$length == 0] = 1
+
+ddsColl <- DESeqDataSetFromTximport(txi, colData = samples_neuron3, design = ~TEA)
+
+#ddsColl <- collapseReplicates(dds, dds$individual, dds$sample)
+
+smallestGroupSize <- 3
+keep <- rowSums(counts(ddsColl) >= 10) >= smallestGroupSize
+ddsColl <- ddsColl[keep,]
+ddsColl <- DESeq(ddsColl)
+resultsNames(ddsColl)
+res_noShrink <- results(ddsColl, name="TEA_yes_vs_no",alpha = 0.05)
+summary(res_noShrink)
+
+# shrinkage of effect size (LFC estimates) is useful for visualization and ranking of genes.
+res <- lfcShrink(ddsColl, coef ="TEA_yes_vs_no", type = "apeglm", svalue = T)
+summary(res)
+```
+
+```{r  warning = TRUE}
+formated_res <- as.data.frame(res) %>%
+  rownames_to_column("gene") %>%
+  arrange(desc(abs(log2FoldChange))) %>%
+  mutate(significative = if_else(svalue < 0.005, "yes", "no")) %>%
+  mutate(up = if_else(log2FoldChange < 0, "nTEA", "yTEA"))
+#formated_res <- merge(formated_res, anot_table, by.x = "gene", by.y = "ensembl_gene_id", all.x = T)
+paged_table(formated_res)
+
+formated_res_noShrink <- as.data.frame(res_noShrink) %>%
+  rownames_to_column("gene") %>%
+  arrange(desc(abs(log2FoldChange))) %>%
+  mutate(significative = if_else(padj < 0.05, "yes", "no")) %>%
+  mutate(up = if_else(log2FoldChange < 0, "nTEA", "yTEA"))
+##formated_res_noShrink <- merge(formated_res_noShrink, anot_table, by.x = "gene", by.y = "ensembl_gene_id", all.x = T)
+
+paged_table(formated_res)
+
+formated_res$symbol <- gsub(".*_","",formated_res$gene)
+formated_res_noShrink$symbol <- gsub(".*_","",formated_res_noShrink$gene)
+
+neuron_nTEA_yTEA_sig <- formated_res[formated_res$significative == "yes",]
+neuron_nTEA_yTEA_downreg <- neuron_nTEA_yTEA_sig[neuron_nTEA_yTEA_sig$up == "nTEA",]
+neuron_nTEA_yTEA_upreg <- neuron_nTEA_yTEA_sig[neuron_nTEA_yTEA_sig$up == "yTEA",]
+
+write.table(formated_res, file = "/PROJECT_DIR/diff_exp/neuron_nTEA_yTEA_shrink_results.txt", row.names = FALSE, sep = "\t", quote = FALSE)
+write.table(neuron_nTEA_yTEA_downreg, file = "/PROJECT_DIR/diff_exp/neuron_nTEA_yTEA_downreg_shrink_results.txt", row.names = FALSE, sep = "\t", quote = FALSE)
+write.table(neuron_nTEA_yTEA_upreg, file = "/PROJECT_DIR/diff_exp/neuron_nTEA_yTEA_upreg_shrink_results.txt", row.names = FALSE, sep = "\t", quote = FALSE)
+write.table(formated_res_noShrink, file = "/PROJECT_DIR/diff_exp/neuron_nTEA_yTEA_results.txt", row.names = FALSE, sep = "\t", quote = FALSE)
+```
+
+- Distribution of quantification values  
+Showing that the distribution of values normalized by varianceStabilizingTransformation is appropriate
+
+```{r  warning = TRUE}
+neuron_nTEA_yTEA_exp <- as.data.frame(counts(ddsColl, normalized = TRUE))
+set <- newSeqExpressionSet(as.matrix(neuron_nTEA_yTEA_exp),phenoData = data.frame(samples_neuron1, row.names=colnames(neuron_nTEA_yTEA_exp)))
+set
+colors <- brewer.pal(8, "Set1")
+plotRLE(set, outline=FALSE,ylim=c(-2, 2), col=colors[as.numeric(factor(samples_neuron1$individual))])
+```
+
+- MA plot shows the mean of the normalized counts vs log2 fold changes for all tested genes
+
+```{r  warning = TRUE}
+DESeq2::plotMA(res)
+```
+
+- Standard deviation of the transformed data across samples, against the mean, using the shifted logarithm transformation, the regularized log transformation, and the variance stabilizing transformation
+
+```{r  warning = TRUE}
+library("vsn")
+vsd <- vst(ddsColl, blind = TRUE)
+meanSdPlot(assay(vsd))
+```
+
+- Generating PCA plots (group)
+
+```{r  warning = TRUE}
+png(
+  "/PROJECT_DIR/diff_exp/neuron_nTEA_yTEA_PCA_grupo.png",
+  width     = 10,
+  height    = 4,
+  units     = "in",
+  res       = 1200
+)
+par(
+  mar = c(2,5,2,5),
+  cex = 1
+)
+pca <- plotPCA(vsd, intgroup = "TEA",ntop = 1000) #use only the top 1000 genes by variability
+#nudge <- position_nudge(y = 3)
+pca + geom_text_repel(size = 3,aes(label = rownames(ddsColl@colData)), max.overlaps = Inf)
+dev.off()
+
+pca + geom_text_repel(size = 3,aes(label = rownames(ddsColl@colData)), max.overlaps = Inf)
+```
+
+- Generating PCA plots (age)
+
+```{r  warning = TRUE}
+png(
+  "/PROJECT_DIR/diff_exp/neuron_nTEA_yTEA_PCA_gene.png",
+  width     = 10,
+  height    = 4,
+  units     = "in",
+  res       = 1200
+)
+par(
+  mar = c(2,5,2,5),
+  cex = 1
+)
+vsd <- vst(ddsColl, blind = TRUE)
+pca <- plotPCA(vsd, intgroup = "age",ntop = 1000)
+#nudge <- position_nudge(y = 3)
+pca + geom_text_repel(size = 3,aes(label = rownames(ddsColl@colData)), max.overlaps = Inf)
+dev.off()
+
+pca + geom_text_repel(size = 3,aes(label = rownames(ddsColl@colData)), max.overlaps = Inf)
+```
+
+- Heatmap of normalized expression
+
+```{r  warning = TRUE}
+normalized_counts <- counts(ddsColl, normalized=TRUE)
+
+#make the DeseQ results as data Frame
+res_table_neuron_nTEA_yTEA_df <- as.data.frame(res)
+sig_neuron_nTEA_yTEA <- data.frame(subset(res_table_neuron_nTEA_yTEA_df, res_table_neuron_nTEA_yTEA_df$svalue < 0.25))
+norm_neuron_nTEA_yTEA <- normalized_counts[row.names(sig_neuron_nTEA_yTEA),]
+
+annotation <- data.frame(sampletype=samples_neuron1[,'condition'],
+                         row.names=colnames(norm_neuron_nTEA_yTEA))#,
+                         #gene_mut=samples[,'gene_mut'])
+
+png(
+  "/PROJECT_DIR/diff_exp/neuron_nTEA_yTEA_heatmap.png",
+  width     = 18,
+  height    = 8,
+  units     = "in",
+  res       = 1200
+)
+par(
+  mar = c(2,5,2,5),
+  cex = 1
+)  
+heat.colors <- brewer.pal(6, "RdYlBu")
+pheatmap(norm_neuron_nTEA_yTEA, color = heat.colors, cluster_rows = T, show_rownames=F,
+         annotation= annotation, border_color=NA, fontsize = 10, scale="row",
+         fontsize_row = 10, height=20)
+dev.off()
+
+pheatmap(norm_neuron_nTEA_yTEA, color = heat.colors, cluster_rows = T, show_rownames=F,
+         annotation= annotation, border_color=NA, fontsize = 10, scale="row",
+         fontsize_row = 10, height=20)
+```
+
+
+## Differential expression between cell types: pipeline test on the samples
+
+
+```{r  warning = TRUE}
+# build the samples manually to change everything easily
+setwd("/PROJECT_DIR/RSEM_quant/")
+samples <- data.frame(sample = as.factor(gsub("(.+?)(\\_.*)", "\\1", list.files(pattern = ".genes.results"))),
+                      condition=c("control","control","control","control",rep("patient",6),rep("control",2),rep("patient",6)),
+                      mut_type=c(rep("none",4),"duplication","deletion","deletion","indel","deletion","snv",
+                                 "none","none","duplication","deletion","deletion","indel","deletion","snv"),
+                      TEA=c(rep("no",7),rep("yes",3),rep("no",5),rep("yes",3)),
+                      individual=c("F07007","F07007","F014932","F012262-4","C023903","C026484","F012161-1","C026023","F012161-4",
+                                   "C026786","F014932","F012262-4","C023903","C026484","F012161-1","C026023","F012161-4","C026786"),
+                      new_name=c("C1","C1","C2","C3","P1","P2","P3","P4","P5","P6","C2","C3","P1","P2","P3","P4","P5","P6"),
+                      age=c(27,27,25,9,16,20,20,15,20,14,25,9,16,20,20,15,20,14),
+                      celltype=c("NSC",rep("neuron",9),rep("NSC",8)))
+samples$data <- paste(samples$new_name,samples$cell_type,sep="_")
+#samples$group <- paste(samples$DMD_condition,samples$TEA,sep="")
+
+files <- list.files(pattern = ".genes.results")
+names(files) <- samples$sample
+all(file.exists(files))
+
+txi = tximport(files, type = "rsem", txIn = FALSE, txOut = FALSE)
+# we tested two lengths (0.01 and 1) and the results were different
+txi$length[txi$length == 0] = 1
+
+ddsColl <- DESeqDataSetFromTximport(txi, colData = samples, design = ~celltype)
+
+#ddsColl <- collapseReplicates(dds, dds$individual, dds$sample)
+
+smallestGroupSize <- 9
+keep <- rowSums(counts(ddsColl) >= 10) >= smallestGroupSize
+ddsColl <- ddsColl[keep,]
+ddsColl <- DESeq(ddsColl)
+resultsNames(ddsColl)
+res_noShrink <- results(ddsColl, name="celltype_NSC_vs_neuron",alpha = 0.05)
+summary(res_noShrink)
+
+# shrinkage of effect size (LFC estimates) is useful for visualization and ranking of genes.
+res <- lfcShrink(ddsColl, coef ="celltype_NSC_vs_neuron", type = "apeglm", svalue = T, lfcThreshold = 0.5)
+summary(res)
+
+formated_res <- as.data.frame(res) %>%
+  rownames_to_column("gene") %>%
+  arrange(desc(abs(log2FoldChange))) %>%
+  mutate(significative = if_else(svalue < 0.005, "yes", "no")) %>%
+  mutate(up = if_else(log2FoldChange < 0, "NSC", "neuron"))
+#formated_res <- merge(formated_res, anot_table, by.x = "gene", by.y = "ensembl_gene_id", all.x = T)
+paged_table(formated_res)
+
+formated_res_noShrink <- as.data.frame(res_noShrink) %>%
+  rownames_to_column("gene") %>%
+  arrange(desc(abs(log2FoldChange))) %>%
+  mutate(significative = if_else(padj < 0.05, "yes", "no")) %>%
+  mutate(up = if_else(log2FoldChange < 0, "NSC", "neuron"))
+##formated_res_noShrink <- merge(formated_res_noShrink, anot_table, by.x = "gene", by.y = "ensembl_gene_id", all.x = T)
+
+paged_table(formated_res)
+
+formated_res$symbol <- gsub(".*_","",formated_res$gene)
+formated_res_noShrink$symbol <- gsub(".*_","",formated_res_noShrink$gene)
+
+cellsig <- formated_res[formated_res$significative == "yes",]
+celldownreg <- cellsig[cellsig$up == "NSC",]
+cellupreg <- cellsig[cellsig$up == "neuron",]
+
+formated_res$symbol <- gsub(".*_","",formated_res$gene)
+write.table(formated_res, file = "/PROJECT_DIR/diff_exp/celltype_shrink_results.txt", row.names = FALSE, sep = "\t", quote = FALSE)
+```
